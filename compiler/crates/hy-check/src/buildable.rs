@@ -261,6 +261,13 @@ fn conversion_kinds_conflict(target: &OpKind, arg: &OpKind) -> bool {
         // Chan target: cannot convert from Int, Float, Bool, Str, Slice, Map, Struct.
         (Chan(_), Int | Float | Bool | Str | Slice(_) | Map(_, _) | Struct(_)) => true,
 
+        // Pointer targets and arguments: Go only converts between pointers.
+        // A pointer cannot convert to or from any non-pointer type; the one
+        // exception is an interface target (`any(p)`), handled above.
+        (Pointer(_), Pointer(_)) => false,
+        (Pointer(_), Interface) => false,
+        (Pointer(_), _) | (_, Pointer(_)) => true,
+
         _ => false,
     }
 }
@@ -576,8 +583,11 @@ impl<'a> Collector<'a> {
         // enum, a type alias, or a built-in conversion target. Anything else
         // stays fail-open.
         let is_declared_type = self.ck.structs.contains_key(name)
+            || self.ck.struct_type_params.contains_key(head)
             || self.ck.enums.contains_key(name)
             || self.ck.type_aliases.contains_key(name)
+            || name == "any"
+            || name == "error"
             || crate::const_init::is_conversion_type_name(name);
         if !is_declared_type {
             return;
@@ -983,6 +993,14 @@ impl<'a> Collector<'a> {
                 span,
             } => {
                 for t in targets {
+                    // #2199: a store whose target is a TYPE NAME cannot build.
+                    // The annotated-store spelling `n T = v` parses as the
+                    // expression statement `n` followed by a store to `T`, and
+                    // Go refuses the second line (`T (type) is not an
+                    // expression`). Same class as #778, one position over.
+                    if let PlaceKind::Ident(name) = &t.kind {
+                        self.check_type_name_in_value_position(name, t.span);
+                    }
                     self.place(t, *op);
                 }
                 for v in values {
@@ -3900,6 +3918,21 @@ impl<'a> Collector<'a> {
                     }
                 } else if name == "pop" {
                     self.check_slice_pop_operands(base, &bk, args, span);
+                    // `pop` is also a built-in slice operation, so this branch
+                    // is entered before the missing-member check below. A
+                    // struct or pointer only has `.pop()` if it declares the
+                    // method; without one Go refuses the call with
+                    // "<base>.pop undefined (type ... has no field or method pop)".
+                    if !has_method && matches!(bk, OpKind::Struct(_) | OpKind::Pointer(_)) {
+                        self.emit_e1002(
+                            span,
+                            format!(
+                                "`{}` has no field or method `pop` (HYB-E1002)",
+                                base.render()
+                            ),
+                            "a struct or pointer supports `.pop()` only when it declares a `pop` method; `pop` is a built-in only on slices",
+                        );
+                    }
                 } else if !has_method {
                     // #682 U2/U3: neither a declared method nor a field exists
                     // on the base. Go refuses the call with `<base>.<name>
